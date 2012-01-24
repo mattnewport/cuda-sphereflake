@@ -80,6 +80,11 @@ __host__ __device__ Vector3 operator+(const float a, const Vector3& b)
 	return MakeVector3(a + b.x, a + b.y, a + b.z);
 }
 
+__host__ __device__ float Length(const Vector3& a)
+{
+	return sqrt(Dot(a, a));
+}
+
 __host__ __device__ Vector3 Normalize(const Vector3& a)
 {
 	return rsqrt(Dot(a, a)) * a;
@@ -88,6 +93,11 @@ __host__ __device__ Vector3 Normalize(const Vector3& a)
 __host__ __device__ float Clamp(float x, float a, float b)
 {
 	return min(max(x, a), b);
+}
+
+Vector3 Lerp(const Vector3& a, const Vector3& b, float t)
+{
+	return a + (b - a) * t;
 }
 
 class Matrix44Affine
@@ -265,13 +275,13 @@ class Sphere
 public:
 	__device__ Sphere(const Vector3 &position, const float radius) :m_position(position), m_radius(radius) { }
 
-	__device__ float Intersect(const Vector3& R0, const Vector3& Rd, Vector3& hit) const;
+	__device__ float Intersect(const Vector3& R0, const Vector3& Rd) const;
 
 	Vector3 m_position;
 	float m_radius;
 };
 
-__device__ float Sphere::Intersect(const Vector3& R0, const Vector3& Rd, Vector3& hit) const
+__device__ float Sphere::Intersect(const Vector3& R0, const Vector3& Rd) const
 {
 	// Sphere centered at [Xc, Yc, Zc] with radius r satisfies equation [X-Xc]^2 + [Y-Yc]^2 + [Z-Zc]^2 - r^2 = 0
 	// Parametric formulation of ray R has equation R(t) = R0 + t*Rd where R0 is an initial position
@@ -299,41 +309,32 @@ __device__ float Sphere::Intersect(const Vector3& R0, const Vector3& Rd, Vector3
 		const float denominator = 1.0f / (2.0f * A);
 		const float t1 = (-B + sqrtDiscrim) * denominator;
 		const float t2 = (-B - sqrtDiscrim) * denominator;
-		const float tMin = min(t1, t2);
-		const float tMax = max(t1, t2);
-		
-		// Cases:
-		// a) tMin, tMax < 0, -> t = FLT_MAX
-		// b) tMin < 0 && tMax >= 0 -> t = t2
-		// c) tMax >= tMin > 0, -> t = t1
-		float t = tMax < 0.0f ? FLT_MAX : (tMin < 0.0f ? tMax : tMin);
-
-		hit = Vector3(R0 + (Rd * t));
-
-		return t;
+		return min(t1, t2);
 	}
 }
 
 // This bound was determined empirically. (i.e. it looks fine with this bound)
-__device__ const float boundingSphereRadius = 8.75f;
+__device__ const float boundingSphereRadius = 10.0f;
 
 class SphereFlake
 {
 public:
-	__device__ SphereFlake(unsigned int levelsOfRecursion, const Vector3 &colorA, const Vector3 &colorB)
+	__device__ SphereFlake(unsigned int levelsOfRecursion)
 		: m_level(levelsOfRecursion),
 		  m_centralSphere(MakeVector3(0.0f, 0.0f, 0.0f), 5.0f),
 		  m_boundingSphere(MakeVector3(0.0f, 0.0f, 0.0f), boundingSphereRadius)
 	{
 	}
 
-	__device__ float IntersectImpl(const Vector3& R0, const Vector3& Rd, float bound, Vector3& sphereCenter);
+	__device__ float IntersectImpl(const Vector3& R0, const Vector3& Rd, Vector3& sphereCenter, int& levelOfHit);
 	__device__ float Intersect(const Vector3& R0, const Vector3& Rd, Vector3& hit, Vector3& hitNormal, Vector3& hitColor);
 
 	unsigned int m_level;
 	Sphere m_centralSphere;
 	Sphere m_boundingSphere;
 
+	const static int NUM_COLORS = 8;
+	static Vector3 sphereColors[NUM_COLORS];
 	const static int NUM_CHILDREN = 7;
 	static const float scaleFactor;	// Controls how much smaller each child sphere flake is.
 	static const float topChildrenZRotation;
@@ -405,8 +406,11 @@ Matrix44Affine SphereFlake::inverseChildTransforms[SphereFlake::NUM_CHILDREN] =
 	Inverse(childTransforms[6]),
 };
 
+Vector3 SphereFlake::sphereColors[SphereFlake::NUM_COLORS];
+
 __constant__ Matrix44Affine deviceChildTransforms[SphereFlake::NUM_CHILDREN];
 __constant__ Matrix44Affine deviceInverseChildTransforms[SphereFlake::NUM_CHILDREN];
+__constant__ Vector3 deviceSphereColors[SphereFlake::NUM_COLORS];
 
 class ChildSphereStack
 {
@@ -418,17 +422,17 @@ public:
 	struct ChildSphereInfo
 	{
 		int level;
-		Vector3 localR0;
-		Vector3 localRd;
 		Vector3 sphereCenter;
+		Vector3 sphereRadius;
+		Vector3 boundSphereRadius;
 	};
 
-	__device__ void Push(int level, const Vector3& newR0, const Vector3& newRd, const Vector3& newSphereCenter)
+	__device__ void Push(int level, const Vector3& newSphereCenter, const Vector3& newSphereRadius, const Vector3& newBoundSphereRadius)
 	{
 		m_stack[m_top].level = level;
-		m_stack[m_top].localR0 = newR0;
-		m_stack[m_top].localRd = newRd;
 		m_stack[m_top].sphereCenter = newSphereCenter;
+		m_stack[m_top].sphereRadius = newSphereRadius;
+		m_stack[m_top].boundSphereRadius = newBoundSphereRadius;
 		++m_top;
 	};
 
@@ -451,32 +455,37 @@ public:
 	ChildSphereInfo m_stack[StackSize];
 };
 
-__device__ float SphereFlake::IntersectImpl(const Vector3& R0, const Vector3& Rd, const float bound, Vector3& sphereCenter)
+__device__ float SphereFlake::IntersectImpl(const Vector3& R0, const Vector3& Rd, Vector3& sphereCenter, int& levelOfHit)
 {
-	float result = bound;
-	Vector3 hit(MakeVector3(0.0f, 0.0f, 0.0f));
+	float result = FLT_MAX;
 
 	ChildSphereStack childSphereStack;
 
 	// Now test all the children.
-	childSphereStack.Push(0, R0, Rd, MakeVector3(0.0f, 0.0f, 0.0f));
+	childSphereStack.Push(0, m_centralSphere.m_position, MakeVector3(m_centralSphere.m_radius, 0.0f, 0.0f), 
+		MakeVector3(m_boundingSphere.m_radius, 0.0f, 0.0f));
 	
 	while (!childSphereStack.Empty())
 	{
 		ChildSphereStack::ChildSphereInfo csi = childSphereStack.Pop();
 
-		const float boundT = m_boundingSphere.Intersect(csi.localR0, csi.localRd, hit);
+		/*
+		const Sphere boundSphere(csi.sphereCenter, Length(csi.boundSphereRadius));
+		const float boundT = boundSphere.Intersect(R0, Rd);
 		if (boundT > result)
 		{
 			continue;
 		}
+		*/
 
-		const float t = m_centralSphere.Intersect(csi.localR0, csi.localRd, hit);
+		const Sphere centralSphere(csi.sphereCenter, Length(csi.sphereRadius));
+		const float t = centralSphere.Intersect(R0, Rd);
 
 		if (t < result)
 		{
 			result = t;
 			sphereCenter = csi.sphereCenter;
+			levelOfHit = csi.level;
 		}
 
 		if (csi.level >= m_level)
@@ -487,15 +496,14 @@ __device__ float SphereFlake::IntersectImpl(const Vector3& R0, const Vector3& Rd
 		for (int childIdx = 0; childIdx != NUM_CHILDREN; ++childIdx)
 		{
 			Matrix44Affine& childTransform = deviceChildTransforms[childIdx];
-			Matrix44Affine& inverseChildTransform = deviceInverseChildTransforms[childIdx];
 
-			const Vector3 newR0 = TransformPoint(csi.localR0, inverseChildTransform);
-			const Vector3 newRd = TransformVector(csi.localRd, inverseChildTransform);
 			const Vector3 newSphereCenter = TransformPoint(csi.sphereCenter, childTransform);
+			const Vector3 newSphereRadius = TransformVector(csi.sphereRadius, childTransform);
+			const Vector3 newBoundSphereRadius = TransformVector(csi.boundSphereRadius, childTransform);
 
 			if (!childSphereStack.Full())
 			{
-				childSphereStack.Push(csi.level + 1, newR0, newRd, newSphereCenter);
+				childSphereStack.Push(csi.level + 1, newSphereCenter, newSphereRadius, newBoundSphereRadius);
 			}
 		}
 	}
@@ -506,13 +514,14 @@ __device__ float SphereFlake::IntersectImpl(const Vector3& R0, const Vector3& Rd
 __device__ float SphereFlake::Intersect(const Vector3& R0, const Vector3& Rd, Vector3& hit, Vector3& hitNormal, Vector3& hitColor)
 {
 	Vector3 sphereCenter(MakeVector3(0.0f, 0.0f, 0.0f));
-	float t = IntersectImpl(R0, Rd, FLT_MAX, sphereCenter);
+	int levelOfHit = 0;
+	float t = IntersectImpl(R0, Rd, sphereCenter, levelOfHit);
 
 	hit = Rd * t + R0;
 
 	// Calculate the normal
 	hitNormal = Normalize(hit - sphereCenter);
-	hitColor = MakeVector3(1.0f, 0.2f, 0.1f);
+	hitColor = deviceSphereColors[levelOfHit % NUM_COLORS];
 
 	return t;
 }
@@ -523,7 +532,7 @@ __device__ Vector3 ShadeRay(const Vector3 &rayStartPos, const Vector3 &rayDirect
 	const Vector3 gBackgroundColor(MakeVector3(0.0f, 0.0f, 0.2f));
 	const float gAmbientIntensity(0.2f);
 
-	SphereFlake sphereFlake(maxLevelsToRecurse, MakeVector3(1.0f,0.3f, 0.3f), MakeVector3(0.0f, 1.0f, 0.0f));
+	SphereFlake sphereFlake(maxLevelsToRecurse);
 	Vector3 hitVector(MakeVector3(0.0f, 0.0f, 0.0f));
 	Vector3 hitNormal(MakeVector3(0.0f, 0.0f, 1.0f));
 	Vector3 hitColor(MakeVector3(0.0f, 0.0f, 0.0f));
@@ -591,9 +600,9 @@ bool outputPPM(const char *fileName, uint32_t *frameContents)
 		for (unsigned int x = 0; x < width; ++x)
 		{
 			unsigned int col = frameContents[y*width + x];
-			unsigned int r = col & 0xff;
+			unsigned int b = col & 0xff;
 			unsigned int g = (col >> 8) & 0xff;
-			unsigned int b = (col >> 16) & 0xff;
+			unsigned int r = (col >> 16) & 0xff;
 			curPos += sprintf(curPos, "%d %d %d ", r, g, b);
 		}
 
@@ -616,6 +625,14 @@ int main(int argc, char **argv)
 
 	VERIFY_CUDA_SUCCESS(cudaMemcpyToSymbol(deviceChildTransforms, &SphereFlake::childTransforms, sizeof(deviceChildTransforms)));
 	VERIFY_CUDA_SUCCESS(cudaMemcpyToSymbol(deviceInverseChildTransforms, &SphereFlake::inverseChildTransforms, sizeof(deviceInverseChildTransforms)));
+
+	// Precompute colors for the spheres
+	for (int i = 0; i < SphereFlake::NUM_COLORS; ++i)
+	{
+		float lerpFactor = cos(2.0f * PI * (float)i / (float)SphereFlake::NUM_COLORS) * 0.5f + 0.5f;
+		SphereFlake::sphereColors[i] = Lerp( MakeVector3(1.0f, 0.3f, 0.3f), MakeVector3(0.0f, 1.0f, 0.0f), lerpFactor);
+	}
+	VERIFY_CUDA_SUCCESS(cudaMemcpyToSymbol(deviceSphereColors, &SphereFlake::sphereColors, sizeof(deviceSphereColors)));
 
 	dim3 dimGrid(width / 16, height / 16);
 	dim3 dimBlock(16, 16);
