@@ -106,9 +106,24 @@ __host__ __device__ Vector3 Clamp(const Vector3& x, float a, float b)
 	return MakeVector3(Clamp(x.x, a, b), Clamp(x.y, a, b), Clamp(x.z, a, b));
 }
 
-Vector3 Lerp(const Vector3& a, const Vector3& b, float t)
+__host__ __device__ Vector3 Lerp(const Vector3& a, const Vector3& b, float t)
 {
 	return a + (b - a) * t;
+}
+
+__host__ __device__ Vector3 Pow(const Vector3& a, float x)
+{
+	return MakeVector3(pow(a.x, x), pow(a.y, x), pow(a.z, x));
+}
+
+__host__ __device__ Vector3 LinearToSRGB(const Vector3& a)
+{
+	return Pow(a, 1.0f / 2.2f);
+}
+
+__host__ __device__ Vector3 SRGBToLinear(const Vector3& a)
+{
+	return Pow(a, 2.2f);
 }
 
 class Matrix44Affine
@@ -329,7 +344,7 @@ __host__ __device__ float Sphere::Intersect(const Vector3& R0, const Vector3& Rd
 	const float B(Dot(Rd,Rp) * 2.0f);
 	const float C(Dot(Rp,Rp) - radiusSqd);
 
-	const float discrim((B * B) - (A * C * 4.0f));
+	const float discrim((B * B) - (4.0f * A * C));
 	
 	if (discrim < 0.0f)
 	{
@@ -338,23 +353,14 @@ __host__ __device__ float Sphere::Intersect(const Vector3& R0, const Vector3& Rd
 	else
 	{
 		const float sqrtDiscrim = sqrt(discrim);
-		const float denominator = 1.0f / (2.0f * A);
-		const float t1 = (-B + sqrtDiscrim) * denominator;
-		const float t2 = (-B - sqrtDiscrim) * denominator;
-		const float tMin = min(t1, t2);
-		const float tMax = max(t1, t2);
+		const float tMax = (-B + sqrtDiscrim);
 		if (tMax < 0.0f)
 		{
 			return FLT_MAX;
 		}
-		else if (tMin < 0.0f)
-		{
-			return tMax;
-		}
-		else
-		{
-			return tMin;
-		}
+		const float denominator = 1.0f / (2.0f * A);
+		const float tMin = (-B - sqrtDiscrim);
+		return tMin < 0.0f ? tMax * denominator : tMin * denominator;
 	}
 }
 
@@ -367,8 +373,10 @@ public:
 	{
 	}
 
+	template<bool FindNearest>
 	__host__ __device__ float IntersectImpl(const Vector3& R0, const Vector3& Rd, Vector3& sphereCenter, int& levelOfHit, Vector3& modulateColor);
 	__host__ __device__ float Intersect(const Vector3& R0, const Vector3& Rd, Vector3& hit, Vector3& hitNormal, Vector3& hitColor);
+	__host__ __device__ float ShadowRayIntersect(const Vector3& R0, const Vector3& Rd);
 
 	unsigned int m_level;
 	Sphere m_centralSphere;
@@ -381,7 +389,6 @@ public:
 	static const float topChildrenZRotation;
 	static const float bottomChildrenZRotation;
 	static Matrix44Affine childTransforms[NUM_CHILDREN];
-	static Matrix44Affine inverseChildTransforms[NUM_CHILDREN];
 };
 
 const float SphereFlake::radius = 5.0f;
@@ -438,35 +445,24 @@ Matrix44Affine SphereFlake::childTransforms[SphereFlake::NUM_CHILDREN] =
 
 };
 
-Matrix44Affine SphereFlake::inverseChildTransforms[SphereFlake::NUM_CHILDREN] =
-{
-	Inverse(childTransforms[0]),
-	Inverse(childTransforms[1]),
-	Inverse(childTransforms[2]),
-	Inverse(childTransforms[3]),
-	Inverse(childTransforms[4]),
-	Inverse(childTransforms[5]),
-	Inverse(childTransforms[6]),
-};
-
 Vector3 SphereFlake::sphereColors[SphereFlake::NUM_COLORS];
 
-Vector3 branchColors[SphereFlake::NUM_CHILDREN] = 
+Vector3 branchColors[SphereFlake::NUM_COLORS] = 
 {
-	{ 1.0f, 0.0f, 0.0f },
-	{ 0.0f, 1.0f, 0.0f },
-	{ 0.0f, 0.0f, 1.0f },
-	{ 1.0f, 1.0f, 0.0f },
-	{ 1.0f, 0.0f, 1.0f },
+	{ 1.0f, 0.1f, 0.1f },
+	{ 0.1f, 1.0f, 0.1f },
+	{ 0.1f, 0.1f, 1.0f },
+	{ 1.0f, 1.0f, 0.1f },
+	{ 1.0f, 0.1f, 1.0f },
 	{ 0.0f, 1.0f, 1.0f },
-	{ 0.5f, 0.5f, 0.0f }
+	{ 0.5f, 0.5f, 0.1f },
+	{ 0.1f, 0.5f, 0.5f }
 };
 
 Matrix44Affine identityMatrix;
 
 __constant__ Matrix44Affine deviceIdentityMatrix;
 __constant__ Matrix44Affine deviceChildTransforms[SphereFlake::NUM_CHILDREN];
-__constant__ Matrix44Affine deviceInverseChildTransforms[SphereFlake::NUM_CHILDREN];
 __constant__ Vector3 deviceSphereColors[SphereFlake::NUM_COLORS];
 __constant__ Vector3 deviceBranchColors[SphereFlake::NUM_CHILDREN];
 __constant__ float deviceScaleFactor;
@@ -520,6 +516,7 @@ public:
 
 int ChildSphereStack::highWaterMark = 0;
 
+template<bool FindNearest>
 __host__ __device__ float SphereFlake::IntersectImpl(const Vector3& R0, const Vector3& Rd, Vector3& sphereCenter, int& levelOfHit, Vector3& modulateColor)
 {
 	float result = FLT_MAX;
@@ -552,6 +549,10 @@ __host__ __device__ float SphereFlake::IntersectImpl(const Vector3& R0, const Ve
 			result = t;
 			sphereCenter = csi.sphereCenter;
 			levelOfHit = csi.level;
+			if (!FindNearest)
+			{
+				return result;
+			}
 		}
 
 		if (csi.level < m_level)
@@ -587,7 +588,7 @@ __host__ __device__ float SphereFlake::Intersect(const Vector3& R0, const Vector
 	Vector3 modulateColor(MakeVector3(1.0f, 1.0f, 1.0f));
 	Vector3 sphereCenter(MakeVector3(0.0f, 0.0f, 0.0f));
 	int levelOfHit = 0;
-	float t = IntersectImpl(R0, Rd, sphereCenter, levelOfHit, modulateColor);
+	float t = IntersectImpl<true>(R0, Rd, sphereCenter, levelOfHit, modulateColor);
 
 	hit = Rd * t + R0;
 
@@ -602,44 +603,67 @@ __host__ __device__ float SphereFlake::Intersect(const Vector3& R0, const Vector
 	return t;
 }
 
-__host__ __device__ Vector3 ShadeRay(const Vector3 &rayStartPos, const Vector3 &rayDirection, int maxLevelsToRecurse=10)
+__host__ __device__ float SphereFlake::ShadowRayIntersect(const Vector3& R0, const Vector3& Rd)
+{
+	Vector3 modulateColor(MakeVector3(1.0f, 1.0f, 1.0f));
+	Vector3 sphereCenter(MakeVector3(0.0f, 0.0f, 0.0f));
+	int levelOfHit = 0;
+	return IntersectImpl<false>(R0, Rd, sphereCenter, levelOfHit, modulateColor);
+}
+
+template<int MaxLevelsToRecurse>
+__host__ __device__ Vector3 ShadeRay(const Vector3 &rayStartPos, const Vector3 &rayDirection)
 {
 	const Vector3 gLightPos(MakeVector3(100.0f, 100.0f, -100.0f));
-	const Vector3 gBackgroundColor(MakeVector3(0.0f, 0.0f, 0.2f));
-	const float gAmbientIntensity(0.2f);
+	const Vector3 gBackgroundColor(SRGBToLinear(MakeVector3(0.02f, 0.02f, 0.2f)));
+	const float gSurfaceReflectivity(0.7f);
 
-	SphereFlake sphereFlake(maxLevelsToRecurse);
+	Vector3 finalColor(gBackgroundColor);
+
+	SphereFlake sphereFlake(10);
 	Vector3 hitVector(MakeVector3(0.0f, 0.0f, 0.0f));
 	Vector3 hitNormal(MakeVector3(0.0f, 0.0f, 1.0f));
 	Vector3 hitColor(MakeVector3(0.0f, 0.0f, 0.0f));
+
 	if (sphereFlake.Intersect(rayStartPos, rayDirection, hitVector, hitNormal, hitColor) < FLT_MAX)
 	{
-			const Vector3 closestHit = hitVector;
-			const Vector3 closestHitNormal = hitNormal;
+		const Vector3 closestHit = hitVector;
+		const Vector3 closestHitNormal = hitNormal;
 			
-			// Calculate light direction
-			const Vector3 lightDirection(Normalize(gLightPos - closestHit));
+		// Calculate light direction
+		const Vector3 lightDirection(Normalize(gLightPos - closestHit));
 
-			// Calculate light intensity.
-			float lightIntensity(gAmbientIntensity);
+		// Calculate light intensity.
+		float lightIntensity(0.0f);
 
-			// Cast shadow rays
-			Vector3 shadowHitVector(MakeVector3(0.0f, 0.0f, 0.0f));
-			Vector3 shadowHitNormal(MakeVector3(0.0f, 0.0f, 1.0f));
-			Vector3 shadowHitColor(MakeVector3(0.0f, 0.0f, 0.0f));
-			float shadowT = sphereFlake.Intersect(closestHit - 0.001f * rayDirection, lightDirection, shadowHitVector, shadowHitNormal, shadowHitColor);
-			if (shadowT == FLT_MAX)
-			{
-				lightIntensity = Clamp(Dot(closestHitNormal, lightDirection), gAmbientIntensity, 1.0f);
-			}
+		// Cast shadow rays
+		Vector3 shadowHitVector(MakeVector3(0.0f, 0.0f, 0.0f));
+		Vector3 shadowHitNormal(MakeVector3(0.0f, 0.0f, 1.0f));
+		Vector3 shadowHitColor(MakeVector3(0.0f, 0.0f, 0.0f));
+		float shadowT = sphereFlake.ShadowRayIntersect(closestHit - 0.001f * rayDirection, lightDirection);
+		if (shadowT == FLT_MAX)
+		{
+			lightIntensity = Clamp(Dot(closestHitNormal, lightDirection), 0.0f, 1.0f);
+		}
 			
-			// Calculate surface color
-			return lightIntensity * hitColor;
+		// Calculate surface color
+		Vector3 surfaceColor = lightIntensity * hitColor;
+
+		// Calculate reflection color
+		Vector3 reflectedDirection = rayDirection - 2.0f * Dot(rayDirection, closestHitNormal) * closestHitNormal;
+		Vector3 reflectedRayColor = ShadeRay<MaxLevelsToRecurse - 1>(closestHit - 0.001f * rayDirection, reflectedDirection);
+
+		finalColor = Lerp(reflectedRayColor, surfaceColor, gSurfaceReflectivity);
 	}
-	else
-	{
-		return gBackgroundColor;
-	}
+
+	return finalColor;
+}
+
+template<>
+__host__ __device__ Vector3 ShadeRay<0>(const Vector3 &rayStartPos, const Vector3 &rayDirection)
+{
+	const Vector3 gBackgroundColor(MakeVector3(0.0f, 0.0f, 0.2f));
+	return gBackgroundColor;
 }
 
 __host__ __device__ Vector3 Raytrace(int x, int y)
@@ -652,14 +676,14 @@ __host__ __device__ Vector3 Raytrace(int x, int y)
 	Vector3 rayStartPos(MakeVector3(-viewWidth * 0.5f * aspectRatio + float(x) * xDelta, viewHeight * 0.5f + float(y) * yDelta, -20.0f));
 	Vector3 rayDirection(MakeVector3(0.0f, 0.0f, 1.0f));
 
-	return ShadeRay(rayStartPos, rayDirection); 
+	return ShadeRay<5>(rayStartPos, rayDirection); 
 }
 
 __global__ void sphereflake(uint32_t* devPtr, size_t pitch, size_t width, size_t height)
 {
 	const int x = blockIdx.x * blockDim.x + threadIdx.x;
 	const int y = blockIdx.y * blockDim.y + threadIdx.y;
-	Vector3 pixColor = Raytrace(x, y);
+	const Vector3 pixColor = LinearToSRGB(Raytrace(x, y));
 	uint32_t* pix = devPtr + (pitch / sizeof(uint32_t)) * y + x;
 	*pix = ((int(pixColor.x * 255.f) & 0xff) << 16) | ((int(pixColor.y * 255.f) & 0xff) << 8) | ((int(pixColor.z * 255.f) & 0xff) << 0);
 }
@@ -670,7 +694,7 @@ void CPUSphereFlake(uint32_t* hostPtr, size_t pitch, size_t width, size_t height
 	{
 		for (int x = 0; x < width; ++x)
 		{
-			Vector3 pixColor = Raytrace(x, y);
+			const Vector3 pixColor = LinearToSRGB(Raytrace(x, y));
 			uint32_t* pix = hostPtr + (pitch / sizeof(uint32_t)) * y + x;
 			*pix = ((int(pixColor.x * 255.f) & 0xff) << 16) | ((int(pixColor.y * 255.f) & 0xff) << 8) | ((int(pixColor.z * 255.f) & 0xff) << 0);
 		}
@@ -723,13 +747,12 @@ int main(int argc, char **argv)
 	VERIFY_CUDA_SUCCESS(cudaMallocPitch(&devPtr, &pitch, width * sizeof(uint32_t), height));
 
 	VERIFY_CUDA_SUCCESS(cudaMemcpyToSymbol(deviceChildTransforms, &SphereFlake::childTransforms, sizeof(deviceChildTransforms)));
-	VERIFY_CUDA_SUCCESS(cudaMemcpyToSymbol(deviceInverseChildTransforms, &SphereFlake::inverseChildTransforms, sizeof(deviceInverseChildTransforms)));
 
 	// Precompute colors for the spheres
 	for (int i = 0; i < SphereFlake::NUM_COLORS; ++i)
 	{
 		float lerpFactor = cos(2.0f * PI * (float)i / (float)SphereFlake::NUM_COLORS) * 0.5f + 0.5f;
-		SphereFlake::sphereColors[i] = Lerp( MakeVector3(1.0f, 0.3f, 0.3f), MakeVector3(0.0f, 1.0f, 0.0f), lerpFactor);
+		SphereFlake::sphereColors[i] = Lerp(SRGBToLinear(MakeVector3(1.0f, 0.3f, 0.3f)), SRGBToLinear(MakeVector3(0.0f, 1.0f, 0.0f)), lerpFactor);
 	}
 	VERIFY_CUDA_SUCCESS(cudaMemcpyToSymbol(deviceSphereColors, &SphereFlake::sphereColors, sizeof(deviceSphereColors)));
 	VERIFY_CUDA_SUCCESS(cudaMemcpyToSymbol(deviceBranchColors, &branchColors, sizeof(deviceBranchColors)));
@@ -740,7 +763,21 @@ int main(int argc, char **argv)
 
 	dim3 dimGrid(width / 16, height / 16);
 	dim3 dimBlock(16, 16);
+
+	cudaEvent_t start;
+	cudaEvent_t stop;
+	VERIFY_CUDA_SUCCESS(cudaEventCreate(&start));
+	VERIFY_CUDA_SUCCESS(cudaEventCreate(&stop));
+	VERIFY_CUDA_SUCCESS(cudaEventRecord(start, 0));
+
 	sphereflake<<<dimGrid, dimBlock>>>(devPtr, pitch, width, height);
+
+	VERIFY_CUDA_SUCCESS(cudaEventRecord(stop, 0));
+	VERIFY_CUDA_SUCCESS(cudaEventSynchronize(stop));
+
+	float elapsedTime = 0.0f;
+	VERIFY_CUDA_SUCCESS(cudaEventElapsedTime(&elapsedTime, start, stop));
+	printf("sphereflake GPU time: %4.1f ms\n", elapsedTime);
 	
 	VERIFY_CUDA_SUCCESS(cudaDeviceSynchronize());
 
